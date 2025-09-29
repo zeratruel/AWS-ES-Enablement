@@ -1,0 +1,313 @@
+# CloudWatch, Lambda & Support API
+# Create a Support Case requesting ES when an account is created within the org
+# This template creates an automated workflow that monitors for new AWS account creation
+# and automatically creates support cases to request Enterprise Support enrollment
+
+
+
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Deploys resources to create support cases for enterprise support on account creation events
+
+
+# Metadata section - Defines the CloudFormation console UI layout for parameters
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: 'Resource Options'
+        Parameters:
+          - pSnsTopicName
+          - pEmailAddress
+
+
+    ParameterLabels:
+      pSnsTopicName:
+        default: SNS Topic Name
+      pEmailAddress:
+        default: Email Address for CC
+   
+# Parameters section - Input values that can be customized when deploying the stack
+Parameters:
+ 
+  # SNS topic name for account lifecycle notifications
+  pSnsTopicName:
+    Type: String
+    Default: account-lifecycle-event-enterprise-support
+
+
+  # Email address for CC on support cases (currently unused but available for future enhancement)
+  pEmailAddress:
+    Type: String
+    AllowedPattern: ^\w+@[a-zA-Z_]+?\.[a-zA-Z]{2,3}$
+
+
+
+
+
+
+# Resources section - AWS resources that will be created by this template
+Resources:
+
+
+  # EventBridge Rule - Monitors for successful account creation events in AWS Organizations
+  # Triggers when a new account is successfully created and forwards the event to SNS
+  rAccountLifecycleEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Rule for account creation lifecycle events
+      EventPattern:
+        {
+          "source": [
+              "aws.organizations"
+          ],
+          "detail-type": [
+            "AWS Service Event via CloudTrail"
+          ],
+          "detail": {
+              "eventSource": [
+                  "organizations.amazonaws.com"
+              ],
+              "eventName": [
+                  "CreateAccountResult"
+              ],
+              "serviceEventDetails": {
+                "createAccountStatus": {
+                  "state": [
+                    "SUCCEEDED"
+                  ]
+                }
+              }
+          }
+        }
+      State: ENABLED
+      Targets:
+        - Arn: !Ref rAccountLifecycleNotificationSns
+          Id: "Account_Lifecycle_Event"
+
+
+  # SNS Topic - Receives account creation events from EventBridge and forwards to Lambda
+  # Topic name includes account ID and region for uniqueness across deployments
+  rAccountLifecycleNotificationSns:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${pSnsTopicName}-${AWS::AccountId}-${AWS::Region}'
+
+
+  # SNS Topic Policy - Defines who can access the SNS topic
+  # Allows the account owner full access and EventBridge service to publish messages
+  rAccountSnsAccessPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          # Default permissions for the account owner
+          - Sid: __default_statement_ID
+            Effect: Allow
+            Principal:
+              AWS: !Ref AWS::AccountId
+            Action:
+            - SNS:GetTopicAttributes
+            - SNS:SetTopicAttributes
+            - SNS:AddPermission
+            - SNS:RemovePermission
+            - SNS:DeleteTopic
+            - SNS:Subscribe
+            - SNS:ListSubscriptionsByTopic
+            - SNS:Publish
+            - SNS:Receive
+            Resource: !Ref rAccountLifecycleNotificationSns
+            Condition:
+              StringEquals:
+                AWS:SourceOwner: !Ref AWS::AccountId
+          # Allow EventBridge to publish messages to this topic
+          - Sid: CloudWatchSnsPublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref rAccountLifecycleNotificationSns
+      Topics:
+        - !Ref rAccountLifecycleNotificationSns
+
+
+  # IAM Role - Execution role for the Lambda function with necessary permissions
+  # Allows Lambda to write logs and interact with AWS Support API
+  rLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # Trust policy - allows Lambda service to assume this role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: SupportCaseLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CloudWatch Logs permissions for Lambda function logging
+              - Sid: LambdaLogging
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              # AWS Support API permissions to create and manage support cases
+              - Sid: SupportPermissions
+                Effect: Allow
+                Action:
+                  - support:AddCommunicationToCase
+                  - support:CreateCase
+                  - support:DescribeCaseAttributes
+                  - support:DescribeIssueTypes
+                  - support:DescribeServices
+                  - support:DescribeSeverityLevels
+                  - support:DescribeSupportLevel
+                  - support:PutCaseAttributes
+                Resource: "*"
+
+
+  # Lambda Function - Processes SNS messages and creates AWS Support cases
+  # Triggered when new accounts are created, automatically requests Enterprise Support enrollment
+  rSupportCaseLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: "index.lambda_handler"
+      FunctionName: Enterprise-Support-Case
+      Role: !GetAtt rLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import os
+
+
+          # Configure logging
+          LOGGER = logging.getLogger()
+          LOGGER.setLevel(logging.INFO)
+
+
+          # Initialize AWS Support client (must use us-east-1 region)
+          support = boto3.client('support', region_name='us-east-1')
+
+
+          # Get email address from environment (currently unused but available for future CC functionality)
+          cc_address = os.environ['EmailAddress']
+
+
+
+
+          def lambda_handler(event, context):
+              """Main Lambda handler function - processes SNS events and creates support cases"""
+              LOGGER.info("Event: " + str(event))
+             
+              try:
+                  # Validate that we received an SNS event with records
+                  if 'Records' not in event or not event['Records']:
+                      LOGGER.error("No Records found in event")
+                      return
+                 
+                  # Parse the SNS message from the event
+                  sns_record = event['Records'][0]
+                  if 'Sns' not in sns_record or 'Message' not in sns_record['Sns']:
+                      LOGGER.error("Invalid SNS record structure")
+                      return
+                 
+                  # Parse the JSON message from EventBridge
+                  message = json.loads(sns_record['Sns']['Message'])
+                  LOGGER.info("Message: " + str(message))
+                 
+                  # Extract the new account ID from the nested event structure
+                  detail = message.get('detail', {})
+                  service_details = detail.get('serviceEventDetails', {})
+                  create_account_status = service_details.get('createAccountStatus', {})
+                  account_id = create_account_status.get('accountId')
+                 
+                  # Validate that we successfully extracted an account ID
+                  if not account_id:
+                      LOGGER.error("Could not extract account ID from event")
+                      LOGGER.error(f"Full message: {json.dumps(message, indent=2)}")
+                      return
+                 
+                  LOGGER.info(f"Creating support case for account: {account_id}")
+                 
+                  # Create AWS Support case requesting Enterprise Support for the new account
+                  response = support.create_case(
+                      issueType='customer-service',
+                      serviceCode='account-management',
+                      categoryCode='billing',
+                      severityCode='low',
+                      subject=f'Add Account {account_id} to Enterprise Support',
+                      communicationBody=f'Please add account number {account_id} to our enterprise support plan.',
+                      language='en'
+                  )
+                 
+                  LOGGER.info(f"Support case created successfully: {response.get('caseId')}")
+                 
+              except json.JSONDecodeError as e:
+                  LOGGER.error(f'Failed to parse SNS message JSON: {e}')
+              except KeyError as e:
+                  LOGGER.error(f'Missing required field in event: {e}')
+              except Exception as e:
+                  LOGGER.error(f'Error generating case for enterprise support: {e}')
+                  LOGGER.error(f'Full event details: {json.dumps(event, indent=2)}')      
+      Runtime: python3.10
+      Timeout: 300
+      Environment:
+        Variables:
+          # Pass email parameter to Lambda for potential future CC functionality
+          EmailAddress: !Ref pEmailAddress
+
+
+  # SNS Subscription - Connects the SNS topic to the Lambda function
+  # When messages are published to the topic, they trigger the Lambda function
+  rLifecycleSnsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !GetAtt rSupportCaseLambda.Arn
+      Protocol: lambda
+      TopicArn: !Ref rAccountLifecycleNotificationSns
+
+
+  # Lambda Permission - Allows SNS service to invoke the Lambda function
+  # Required for SNS to successfully trigger the Lambda when messages are published
+  rSnsLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref rSupportCaseLambda
+      Principal: sns.amazonaws.com
+
+
+
+
+# Outputs section - Values that can be referenced by other CloudFormation stacks
+# These exports allow other stacks to reference these resources
+Outputs:
+
+
+  # SNS Topic ARN - Can be used by other stacks to publish to this topic
+  oAccountLifecycleNotificationSns:
+    Description: Target SNS topic for Cloudwatch Event generated on account creation succeeding
+    Value: !Ref rAccountLifecycleNotificationSns
+    Export:
+      Name: Account-Lifecycle-Support-Sns
+
+
+  # Lambda Function ARN - Can be used by other stacks to reference this function
+  oLambdaArn:
+    Description: The Arn value of the Account Lifecycle Enterprise Support Function
+    Value: !GetAtt rSupportCaseLambda.Arn
+    Export:
+      Name: Support-Case-Lambda
+
